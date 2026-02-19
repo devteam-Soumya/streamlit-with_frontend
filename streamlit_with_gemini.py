@@ -1,11 +1,13 @@
 import os
+from urllib.parse import urljoin
+
 import streamlit as st
 import requests
 
 st.set_page_config(page_title="Virtual Try-On", layout="wide")
 st.title("Virtual Try-On – Gemini + IDM-VTON + Overlay Fallback")
 
-# Prefer env var (Streamlit Cloud supports secrets/env vars)
+# Prefer env var in deployment (Streamlit Cloud supports secrets/env vars)
 DEFAULT_API_BASE = os.getenv("API_BASE", "http://3.88.24.123:8000").rstrip("/")
 
 api_base = st.sidebar.text_input("Backend URL", DEFAULT_API_BASE).rstrip("/")
@@ -17,19 +19,15 @@ def health():
     r.raise_for_status()
     return r.json()
 
-def post_tryon(path: str, files: dict, garment_des: str):
-    data = {
-        "garment_des": garment_des,
-        "prefer_idm": 1 if prefer_idm else 0
-    }
-    r = requests.post(
-        f"{api_base}{path}",
-        files=files,
-        data=data,
-        timeout=timeout
-    )
-    r.raise_for_status()
-    return r.json()
+def resolve_image_url(u: str) -> str:
+    """Handle absolute URLs + relative paths returned by backend."""
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    # Convert "/outputs/x.png" or "outputs/x.png" -> "{api_base}/outputs/x.png"
+    return urljoin(api_base + "/", u.lstrip("/"))
 
 def show_result(data: dict):
     st.write("Mode used:", data.get("mode_used"))
@@ -37,13 +35,27 @@ def show_result(data: dict):
     st.json(data.get("scores", {}))
 
     urls = data.get("output_urls") or []
+    st.write("output_urls:", urls)  # Debug (remove later)
+
     if not urls:
-        st.warning("No output images returned from backend.")
+        st.warning("No output images returned (output_urls is empty).")
         return
 
-    for u in urls:
-        # New Streamlit API (replaces use_column_width/use_container_width)
-        st.image(u, width="stretch")
+    for raw_u in urls:
+        img_url = resolve_image_url(raw_u)
+        if not img_url:
+            continue
+
+        try:
+            # Fetch bytes server-side to avoid browser mixed-content blocking (https Streamlit + http backend)
+            resp = requests.get(img_url, timeout=60)
+            resp.raise_for_status()
+
+            # New Streamlit API (avoid deprecated params)
+            st.image(resp.content, width="stretch")
+
+        except Exception as e:
+            st.error(f"Failed to load image from {raw_u} -> {img_url}: {e}")
 
 if st.sidebar.button("Health Check"):
     try:
@@ -70,14 +82,20 @@ with tab1:
                 "actress_image": ("actress.jpg", actress.getvalue(), actress.type),
                 "user_image": ("user.jpg", user.getvalue(), user.type),
             }
+            data = {"garment_des": garment_des, "prefer_idm": 1 if prefer_idm else 0}
+
             with st.spinner("Processing..."):
                 try:
-                    data = post_tryon("/v1/tryon/actress-to-user", files, garment_des)
-                    show_result(data)
-                except requests.exceptions.RequestException as e:
-                    st.error(f"Request failed: {e}")
+                    r = requests.post(
+                        f"{api_base}/v1/tryon/actress-to-user",
+                        files=files,
+                        data=data,
+                        timeout=timeout,
+                    )
+                    r.raise_for_status()
+                    show_result(r.json())
                 except Exception as e:
-                    st.error(f"Unexpected error: {e}")
+                    st.error(str(e))
 
 with tab2:
     st.subheader("Garment → User")
@@ -95,11 +113,17 @@ with tab2:
                 "garment_image": ("garment.jpg", garment.getvalue(), garment.type),
                 "user_image": ("user.jpg", user2.getvalue(), user2.type),
             }
+            data = {"garment_des": garment_des2, "prefer_idm": 1 if prefer_idm else 0}
+
             with st.spinner("Processing..."):
                 try:
-                    data = post_tryon("/v1/tryon/garment-to-user", files, garment_des2)
-                    show_result(data)
-                except requests.exceptions.RequestException as e:
-                    st.error(f"Request failed: {e}")
+                    r = requests.post(
+                        f"{api_base}/v1/tryon/garment-to-user",
+                        files=files,
+                        data=data,
+                        timeout=timeout,
+                    )
+                    r.raise_for_status()
+                    show_result(r.json())
                 except Exception as e:
-                    st.error(f"Unexpected error: {e}")
+                    st.error(str(e))
